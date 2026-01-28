@@ -832,6 +832,20 @@ extern "C" {
         stream: i64,
     );
 
+    // Strided version for column-major scale tensors (SM100+ Blackwell)
+    pub fn moe_fp8_shuffle_rows_f32_strided(
+        input: *const f32,
+        dst2src_map: *const i32,
+        output: *mut f32,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        src_row_stride: i64,
+        dst_row_stride: i64,
+        map_divisor: c_int,
+        stream: i64,
+    );
+
     pub fn moe_fp8_scatter_rows_f16(
         input: *const c_void,
         src2dst_map: *const i32,
@@ -861,6 +875,7 @@ extern "C" {
         b_scales: *const f32,
         expert_offsets: *const i32,
         num_experts: c_int,
+        m: c_int,
         n: c_int,
         k: c_int,
         block_size_n: c_int,
@@ -877,6 +892,7 @@ extern "C" {
         b_scales: *const f32,
         expert_offsets: *const i32,
         num_experts: c_int,
+        m: c_int,
         n: c_int,
         k: c_int,
         block_size_n: c_int,

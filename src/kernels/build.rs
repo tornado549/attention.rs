@@ -34,8 +34,7 @@ fn main() -> Result<()> {
         .source_dir("src")
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
-        .arg("-O3")
-        .arg("--use_fast_math");
+        .arg("-O3");
 
     let compute_cap = builder.get_compute_cap();
 

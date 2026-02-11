@@ -82,12 +82,12 @@ fn main() -> Result<()> {
 
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
         println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
-        // DO not change this, this featch custom flashinfer v0.6.3 headers
+        // DO not change this, this featch custom flashinfer v0.6.2 headers
         // which is compatible with our code (added more gqa group_size)
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
             "https://github.com/guoqingbao/flashinfer.git",
-            "05d49ada05a8ef90c24b8e680228f57b198b3ef8", // v0.6.3
+            "9d5495241fa6aebde4733e121d0e0734a165737f", // v0.6.2
             vec!["include"],
             false,
         );

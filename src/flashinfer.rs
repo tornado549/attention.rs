@@ -8,8 +8,8 @@ use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
 use std::cell::RefCell;
 
 /// Workspace buffer sizes for FlashInfer operations
-pub(crate) const WORKSPACE_FLOAT_SIZE: usize = 256 * 1024 * 1024; // 256 MB
-const WORKSPACE_INT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+pub(crate) const WORKSPACE_FLOAT_SIZE: usize = 384 * 1024 * 1024; // 256 MB
+const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024; // 128 MB
 
 /// Static workspace buffers for FlashInfer to avoid per-call allocation
 struct PinnedHostBuffer {
@@ -70,6 +70,19 @@ struct FlashInferWorkspace {
 thread_local! {
     static WORKSPACE: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
     static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
+}
+
+fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
+    matches!(group_size, 1 | 2 | 3 | 4 | 8 | 16 | 32 | 64)
+}
+
+fn is_supported_flashinfer_decode_group_size(group_size: usize) -> bool {
+    matches!(group_size, 1 | 2 | 3 | 4 | 8 | 16 | 32 | 64)
+}
+
+fn is_supported_flashinfer_decode_shape(group_size: usize, head_dim: usize) -> bool {
+    // decode launch can exceed 1024 threads for (group_size=64, head_dim=256)
+    !(group_size == 64 && head_dim > 128)
 }
 
 pub(crate) fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
@@ -428,6 +441,27 @@ impl FlashInferDecodeWithPlan {
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
         let (batch_size, _, _) = q_l.shape().dims3()?;
+        if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
+            candle::bail!(
+                "invalid flashinfer decode head config: qo_heads={} kv_heads={}",
+                self.num_qo_heads,
+                self.num_kv_heads
+            );
+        }
+        let group_size = self.num_qo_heads / self.num_kv_heads;
+        if !is_supported_flashinfer_decode_group_size(group_size) {
+            candle::bail!(
+                "flashinfer decode only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+                group_size
+            );
+        }
+        if !is_supported_flashinfer_decode_shape(group_size, self.head_dim) {
+            candle::bail!(
+                "flashinfer decode unsupported combination: group_size={} head_dim={} (group_size=64 requires head_dim<=128)",
+                group_size,
+                self.head_dim
+            );
+        }
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
         let vc_ptr = get_cuda_ptr(&self.value_cache)?;
@@ -605,6 +639,27 @@ pub fn decode_plan(
     enable_cuda_graph: bool,
 ) -> Result<Vec<i64>> {
     let dev = dev.as_cuda_device()?;
+    if num_kv_heads == 0 || num_qo_heads % num_kv_heads != 0 {
+        candle::bail!(
+            "invalid flashinfer decode head config: qo_heads={} kv_heads={}",
+            num_qo_heads,
+            num_kv_heads
+        );
+    }
+    let group_size = num_qo_heads / num_kv_heads;
+    if !is_supported_flashinfer_decode_group_size(group_size) {
+        candle::bail!(
+            "flashinfer decode only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+            group_size
+        );
+    }
+    if !is_supported_flashinfer_decode_shape(group_size, head_dim) {
+        candle::bail!(
+            "flashinfer decode unsupported combination: group_size={} head_dim={} (group_size=64 requires head_dim<=128)",
+            group_size,
+            head_dim
+        );
+    }
 
     if indptr_host.len() != batch_size + 1 {
         candle::bail!(
@@ -746,6 +801,20 @@ impl FlashInferPrefill {
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
         let (_total_tokens, _num_heads, _head_dim) = q_l.shape().dims3()?;
+        if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
+            candle::bail!(
+                "invalid flashinfer prefill head config: qo_heads={} kv_heads={}",
+                self.num_qo_heads,
+                self.num_kv_heads
+            );
+        }
+        let group_size = self.num_qo_heads / self.num_kv_heads;
+        if !is_supported_flashinfer_gqa_group_size(group_size) {
+            candle::bail!(
+                "flashinfer prefill only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+                group_size
+            );
+        }
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
         let vc_ptr = get_cuda_ptr(&self.value_cache)?;
@@ -935,6 +1004,20 @@ impl FlashInferRaggedPrefill {
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
+        if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
+            candle::bail!(
+                "invalid flashinfer ragged prefill head config: qo_heads={} kv_heads={}",
+                self.num_qo_heads,
+                self.num_kv_heads
+            );
+        }
+        let group_size = self.num_qo_heads / self.num_kv_heads;
+        if !is_supported_flashinfer_gqa_group_size(group_size) {
+            candle::bail!(
+                "flashinfer ragged prefill only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+                group_size
+            );
+        }
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
         let k_ptr = get_cuda_ptr(&self.key)?;
         let v_ptr = get_cuda_ptr(&self.value)?;

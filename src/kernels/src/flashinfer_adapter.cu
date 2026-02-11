@@ -19,43 +19,13 @@
 
 #include <flashinfer/attention/default_decode_params.cuh>
 #include <flashinfer/page.cuh>
+#include <flashinfer/utils.cuh>
 
 #if defined(SM_90_PASS)
 #include <cutlass/numeric_types.h>
 #endif
 #include <flashinfer/pos_enc.cuh>
 using namespace flashinfer;
-
-#define DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, ...) \
-  if (group_size == 1) {                                     \
-    constexpr size_t GROUP_SIZE = 1;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 2) {                              \
-    constexpr size_t GROUP_SIZE = 2;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 3) {                              \
-    constexpr size_t GROUP_SIZE = 3;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 4) {                              \
-    constexpr size_t GROUP_SIZE = 4;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 8) {                              \
-    constexpr size_t GROUP_SIZE = 8;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 16) {                              \
-    constexpr size_t GROUP_SIZE = 16;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 32) {                              \
-    constexpr size_t GROUP_SIZE = 32;                         \
-    __VA_ARGS__                                              \
-  } else if (group_size == 64) {                              \
-    constexpr size_t GROUP_SIZE = 64;                         \
-    __VA_ARGS__                                              \
-  } else {                                                   \
-    std::ostringstream err_msg;                              \
-    err_msg << "Unsupported group_size: " << group_size;     \
-    FLASHINFER_ERROR(err_msg.str());                         \
-  }
 
 #if !defined(SM_90_PASS)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
@@ -73,20 +43,34 @@ using DefaultAttentionAlias = DefaultAttention<use_logits_soft_cap>;
 struct DefaultDecodeAttention {
     static constexpr bool use_softmax = true;
     uint32_t kv_len;
+    uint32_t window_left;
     float sm_scale_log2;
+    float soft_cap_pre_tanh_scale;
+    bool use_logits_soft_cap;
 
     template <typename Params>
     __device__ __host__ DefaultDecodeAttention(const Params& params, uint32_t batch_idx,
                                                uint8_t* smem_ptr) {
         (void)smem_ptr;
         kv_len = params.get_kv_len(batch_idx);
-        sm_scale_log2 = params.sm_scale * math::log2e;
+        window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+        use_logits_soft_cap = params.logits_soft_cap > 0.f;
+        if (use_logits_soft_cap) {
+            soft_cap_pre_tanh_scale = params.sm_scale / params.logits_soft_cap;
+            sm_scale_log2 = math::log2e * params.logits_soft_cap;
+        } else {
+            soft_cap_pre_tanh_scale = 0.f;
+            sm_scale_log2 = params.sm_scale * math::log2e;
+        }
     }
 
     template <typename Params, typename T>
     __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
                                                  uint32_t qo_idx, uint32_t kv_idx,
                                                  uint32_t qo_head_idx, uint32_t kv_head_idx) {
+        if (use_logits_soft_cap) {
+            logits = math::tanh(logits * soft_cap_pre_tanh_scale);
+        }
         return logits;
     }
 
@@ -94,7 +78,7 @@ struct DefaultDecodeAttention {
     __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-        return true;
+        return (kv_idx + 1 + window_left >= kv_len + qo_idx);
     }
 
     template <typename Params, typename T, typename T_M>
@@ -238,6 +222,21 @@ static inline void FillSM90RaggedParams(
 #endif
 
 #endif // Flashinfer
+
+#ifdef USE_FLASHINFER
+static inline bool IsSupportedDecodeGroupSize(uint32_t group_size) {
+    return group_size == 1 || group_size == 2 || group_size == 3 || group_size == 4 ||
+           group_size == 8 || group_size == 16 || group_size == 32 || group_size == 64;
+}
+
+static inline bool IsSupportedDecodeHeadDimForGroupSize(uint32_t group_size, uint32_t head_dim) {
+    // group_size=64 can exceed 1024 threads for HEAD_DIM=256 in decode kernels.
+    if (group_size == 64) {
+        return head_dim <= 128;
+    }
+    return true;
+}
+#endif
 
 #if defined(SM_90_PASS)
 #define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, ...) \
@@ -449,6 +448,25 @@ void flashinfer_decode_plan_wrapper(
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
+    if (num_kv_heads <= 0 || num_qo_heads <= 0 || (num_qo_heads % num_kv_heads) != 0) {
+        fprintf(stderr,
+                "[flashinfer][decode_plan] invalid head config qo_heads=%d kv_heads=%d\n",
+                num_qo_heads, num_kv_heads);
+        return;
+    }
+    uint32_t group_size = static_cast<uint32_t>(num_qo_heads / num_kv_heads);
+    if (!IsSupportedDecodeGroupSize(group_size)) {
+        fprintf(stderr,
+                "[flashinfer][decode_plan] unsupported group_size=%u (supported: 1,2,3,4,8,16,32,64)\n",
+                group_size);
+        return;
+    }
+    if (!IsSupportedDecodeHeadDimForGroupSize(group_size, static_cast<uint32_t>(head_dim))) {
+        fprintf(stderr,
+                "[flashinfer][decode_plan] unsupported combination group_size=%u head_dim=%d (group_size=64 requires head_dim<=128)\n",
+                group_size, head_dim);
+        return;
+    }
     if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
         return;
     }
@@ -460,10 +478,8 @@ void flashinfer_decode_plan_wrapper(
             using DTypeOut = DTypeQ;
             using IdType = int32_t;
 
-            uint32_t group_size = num_qo_heads / num_kv_heads;
-
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
+                DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
                     using AttentionType = DefaultDecodeAttention;
                     using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
@@ -508,10 +524,8 @@ void flashinfer_decode_plan_wrapper(
         using DTypeOut = DTypeKV;
         using IdType = int32_t;
 
-        uint32_t group_size = num_qo_heads / num_kv_heads;
-
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
+            DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
                 using AttentionType = DefaultDecodeAttention;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
@@ -577,6 +591,25 @@ void flashinfer_decode_run_wrapper(
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
+    if (num_kv_heads <= 0 || num_qo_heads <= 0 || (num_qo_heads % num_kv_heads) != 0) {
+        fprintf(stderr,
+                "[flashinfer][decode_run] invalid head config qo_heads=%d kv_heads=%d\n",
+                num_qo_heads, num_kv_heads);
+        return;
+    }
+    uint32_t group_size = static_cast<uint32_t>(num_qo_heads / num_kv_heads);
+    if (!IsSupportedDecodeGroupSize(group_size)) {
+        fprintf(stderr,
+                "[flashinfer][decode_run] unsupported group_size=%u (supported: 1,2,3,4,8,16,32,64)\n",
+                group_size);
+        return;
+    }
+    if (!IsSupportedDecodeHeadDimForGroupSize(group_size, static_cast<uint32_t>(head_dim))) {
+        fprintf(stderr,
+                "[flashinfer][decode_run] unsupported combination group_size=%u head_dim=%d (group_size=64 requires head_dim<=128)\n",
+                group_size, head_dim);
+        return;
+    }
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
     if (data_type == 2) {
@@ -673,7 +706,7 @@ void flashinfer_decode_run_wrapper(
                 (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
                 nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
                 num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
+                window_left > 0 ? window_left : -1 /* window_left */, logits_soft_cap /* logits_cap */, sm_scale, rope_scale, rope_theta
             );
             
             params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);

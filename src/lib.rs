@@ -319,13 +319,16 @@ impl PagedAttention {
         {
             let block_tables = input_metadata.block_tables.as_ref().unwrap();
             let context_lens = input_metadata.context_lens.as_ref().unwrap();
-            candle_flash_attn::flash_attn_with_kvcache(
+            candle_flash_attn::flash_attn_with_kvcache_windowed_softcap(
                 &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
                 context_lens,
                 block_tables,
                 self.scale as f32,
+                Some(softcapping.unwrap_or(0.0f64) as f32),
+                self.sliding_window,
+                Some(0),
             )
         }
         #[cfg(not(feature = "flash-decoding"))]

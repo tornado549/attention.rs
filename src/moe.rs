@@ -93,7 +93,7 @@ pub fn moe_gemm(
         use core::ffi::c_void;
 
         unsafe {
-            if is_prefill || size_m > 8 {
+            if is_prefill || size_m > 128 {
                 let expert_counts = dev.alloc::<u32>(num_experts).w()?;
                 let expert_offsets = dev.alloc::<u32>(num_experts + 1).w()?;
                 ffi::moe_gemm_wmma(
@@ -297,7 +297,7 @@ pub fn moe_gemm_fp8(
         #[cfg(not(feature = "cutlass"))]
         let use_cutlass = false;
 
-        if use_cutlass {
+        if use_cutlass && (is_prefill || size_m > 128) {
             #[cfg(feature = "cutlass")]
             {
                 let k_blocks = (size_k + block_size_k - 1) / block_size_k;
@@ -505,7 +505,7 @@ pub fn moe_gemm_fp8(
         use core::ffi::c_void;
 
         unsafe {
-            if is_prefill || size_m > 8 {
+            if is_prefill || size_m > 128 {
                 let expert_counts = dev.alloc::<u32>(num_experts).w()?;
                 let expert_offsets = dev.alloc::<u32>(num_experts + 1).w()?;
                 ffi::moe_gemm_wmma_fp8(

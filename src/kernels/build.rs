@@ -27,6 +27,15 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_fp8_qquant.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_adapter_fp8.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_bmm_fp8.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_moe_adapter.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_batched_gemm_runner.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_runner.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_dev_kernel.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_renormalize.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_deepseek.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_llama4.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_cutlass_heuristic.cpp");
     println!("cargo:rerun-if-changed=src/gdn.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
@@ -68,6 +77,7 @@ fn main() -> Result<()> {
         builder = builder.arg("-DUSE_CUTLASS").with_cutlass(None);
 
         if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+            builder = builder.arg("-DENABLE_BF16").arg("-DENABLE_FP8");
             if compute_cap >= 89 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E8M0");
             }
@@ -89,10 +99,54 @@ fn main() -> Result<()> {
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
             "https://github.com/guoqingbao/flashinfer.git",
-            "960cb902ce15ec085d42aa1bbe7026979c9a04dd", // v0.6.2
-            vec!["include"],
+            "3bffdb76eef5fec462254dde67a7de0c4bcb9905", // v0.6.2
+            vec![
+                "include",
+                "include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export",
+                "include/flashinfer/trtllm/gemm/trtllmGen_gemm_export",
+                "csrc/nv_internal",
+                "csrc/nv_internal/include",
+                "csrc/nv_internal/tensorrt_llm/cutlass_extensions/include",
+            ],
+            vec![
+                "csrc/nv_internal/cpp/common",
+                "csrc/nv_internal/tensorrt_llm",
+            ],
             false,
         );
+
+        let flashinfer_root = builder.fetch_git_dependency("flashinfer")?;
+        let csrc_dir = flashinfer_root.join("csrc");
+        let trtllm_dir = csrc_dir.join("nv_internal").join("tensorrt_llm");
+
+        if matches!(compute_cap, 90 | 100) && trtllm_dir.exists() {
+            let include_define = format!(
+                "-DATTENTION_RS_FLASHINFER_TRTLLM_INCLUDE_DIR=\\\"{}\\\"",
+                trtllm_dir.display()
+            );
+            builder = builder
+                .arg("-DATTENTION_RS_USE_FLASHINFER_BLOCKSCALE")
+                .arg("-DCOMPILE_HOPPER_TMA_GEMMS")
+                .arg("-DENABLE_FP8_BLOCK_SCALE")
+                .arg(&include_define)
+                .include_path(csrc_dir.join("nv_internal/tensorrt_llm/kernels/cutlass_kernels/include"))
+                .include_path(csrc_dir.join("nv_internal/tensorrt_llm/kernels/cutlass_kernels"))
+                .source_files(vec![
+                    csrc_dir.join(
+                        "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
+                    ),
+                    csrc_dir.join("nv_internal/cpp/common/envUtils.cpp"),
+                    csrc_dir.join("nv_internal/cpp/common/logger.cpp"),
+                    csrc_dir.join("nv_internal/cpp/common/stringUtils.cpp"),
+                    csrc_dir.join("nv_internal/cpp/common/tllmException.cpp"),
+                    csrc_dir.join("nv_internal/cpp/common/memoryUtils.cu"),
+                ]);
+        } else if matches!(compute_cap, 90 | 100) {
+            println!(
+                "cargo:warning=flashinfer TensorRT-LLM sources not found at {}, skipping blockscale fp8 wrapper",
+                trtllm_dir.display()
+            );
+        }
     }
 
     // Target handling

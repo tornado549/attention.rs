@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, str};
-const METAL_SOURCES: [&str; 8] = [
+const METAL_SOURCES: [&str; 9] = [
     "copy_blocks",
     "pagedattention",
     "reshape_and_cache",
@@ -10,6 +10,7 @@ const METAL_SOURCES: [&str; 8] = [
     "update_scales",
     "fused_rope",
     "fp8_matmul",
+    "gdn",
 ];
 
 enum Platform {

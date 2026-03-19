@@ -1,3 +1,9 @@
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!("Enable exactly one backend feature: `cuda` or `metal`, not both.");
+
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
+
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;

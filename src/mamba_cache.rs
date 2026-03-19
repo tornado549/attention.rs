@@ -10,13 +10,18 @@
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use std::collections::{HashMap, VecDeque};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "metal")]
+use candle_core::backend::BackendStorage;
+#[cfg(feature = "metal")]
+use metal_kernels;
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[derive(Debug, Clone)]
 struct ScatterRowsUpdate {
     slots: Tensor,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl candle_core::InplaceOp2 for ScatterRowsUpdate {
     fn name(&self) -> &'static str {
         "mamba-scatter-rows-update"
@@ -32,6 +37,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
         candle_core::bail!("mamba-scatter-rows-update is CUDA only")
     }
 
+    #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
         dst: &mut candle_core::CudaStorage,
@@ -144,19 +150,80 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
         }
         Ok(())
     }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        dst: &mut candle_core::MetalStorage,
+        dst_layout: &candle_core::Layout,
+        src: &candle_core::MetalStorage,
+        src_layout: &candle_core::Layout,
+    ) -> Result<()> {
+        let num_rows = src_layout.shape().dims()[0];
+        if num_rows == 0 {
+            return Ok(());
+        }
+        if src.dtype() != dst.dtype() {
+            candle_core::bail!(
+                "mamba scatter dtype mismatch: src={:?} dst={:?}",
+                src.dtype(),
+                dst.dtype()
+            );
+        }
+
+        let row_elems = src_layout.shape().elem_count() / num_rows;
+        let src_row_stride = src_layout.stride()[0] as i64;
+        let dst_row_stride = dst_layout.stride()[0] as i64;
+        let elem_size = src.dtype().size_in_bytes();
+
+        let (slots_storage, slots_layout) = self.slots.storage_and_layout();
+        let slots_storage = match &*slots_storage {
+            candle_core::Storage::Metal(s) => s.clone(),
+            _ => candle_core::bail!("slots tensor must be a Metal tensor"),
+        };
+        if slots_layout.shape().elem_count() != num_rows {
+            candle_core::bail!(
+                "slots length mismatch in mamba scatter: slots={} rows={}",
+                slots_layout.shape().elem_count(),
+                num_rows
+            );
+        }
+
+        let dev = dst.device();
+        let command_buffer = dev.command_buffer()?;
+        command_buffer.set_label("mamba-scatter-rows-update");
+        metal_kernels::call_gdn_mamba_scatter_rows(
+            dev.device(),
+            &*command_buffer,
+            metal_kernels::Kernels::default(),
+            dst.dtype(),
+            src.buffer(),
+            src_layout.start_offset() * elem_size,
+            dst.buffer(),
+            dst_layout.start_offset() * elem_size,
+            slots_storage.buffer(),
+            slots_layout.start_offset() * std::mem::size_of::<i64>(),
+            num_rows as i32,
+            row_elems as i32,
+            src_row_stride,
+            dst_row_stride,
+        )
+        .map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
 }
 
-#[cfg(feature = "cuda")]
-fn scatter_rows_cuda(dst: &Tensor, slots: &Tensor, src: &Tensor) -> Result<()> {
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn scatter_rows_accel(dst: &Tensor, slots: &Tensor, src: &Tensor) -> Result<()> {
     let num_slots = slots.dim(0)?;
     if num_slots == 0 {
         return Ok(());
     }
-    if !matches!(dst.device(), Device::Cuda(_))
-        || !matches!(src.device(), Device::Cuda(_))
-        || !matches!(slots.device(), Device::Cuda(_))
+    if !matches!(dst.device(), Device::Cuda(_) | Device::Metal(_))
+        || !matches!(src.device(), Device::Cuda(_) | Device::Metal(_))
+        || !matches!(slots.device(), Device::Cuda(_) | Device::Metal(_))
     {
-        candle_core::bail!("Mamba cache updates require CUDA tensors");
+        candle_core::bail!("Mamba cache updates require CUDA or Metal tensors");
     }
     if slots.dtype() != DType::I64 {
         candle_core::bail!(
@@ -420,7 +487,7 @@ impl MambaCache {
 
     /// Reset (zero out) all states for a given slot
     fn reset_slot_states(&mut self, slot: usize) -> Result<()> {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         {
             let device = self
                 .conv_states
@@ -428,61 +495,64 @@ impl MambaCache {
                 .map(|t| t.device().clone())
                 .or_else(|| self.recurrent_states.first().map(|t| t.device().clone()))
                 .ok_or_else(|| candle_core::Error::Msg("MambaCache has no layers".to_string()))?;
-            let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), &device)?;
+            if matches!(device, Device::Cuda(_) | Device::Metal(_)) {
+                let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), &device)?;
 
-            for layer_idx in 0..self.num_gdn_layers {
-                let conv_dim = self.conv_states[layer_idx].dim(1)?;
-                let conv_window = self.conv_states[layer_idx].dim(2)?;
-                let conv_zeros = Tensor::zeros(
-                    (1, conv_dim, conv_window),
-                    self.conv_states[layer_idx].dtype(),
-                    self.conv_states[layer_idx].device(),
-                )?;
-                scatter_rows_cuda(&self.conv_states[layer_idx], &slot_tensor, &conv_zeros)?;
+                for layer_idx in 0..self.num_gdn_layers {
+                    let conv_dim = self.conv_states[layer_idx].dim(1)?;
+                    let conv_window = self.conv_states[layer_idx].dim(2)?;
+                    let conv_zeros = Tensor::zeros(
+                        (1, conv_dim, conv_window),
+                        self.conv_states[layer_idx].dtype(),
+                        self.conv_states[layer_idx].device(),
+                    )?;
+                    scatter_rows_accel(&self.conv_states[layer_idx], &slot_tensor, &conv_zeros)?;
 
-                let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
-                let rec_h = self.recurrent_states[layer_idx].dim(2)?;
-                let rec_w = self.recurrent_states[layer_idx].dim(3)?;
-                let rec_zeros = Tensor::zeros(
-                    (1, rec_heads, rec_h, rec_w),
-                    self.recurrent_states[layer_idx].dtype(),
-                    self.recurrent_states[layer_idx].device(),
-                )?;
-                scatter_rows_cuda(&self.recurrent_states[layer_idx], &slot_tensor, &rec_zeros)?;
+                    let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
+                    let rec_h = self.recurrent_states[layer_idx].dim(2)?;
+                    let rec_w = self.recurrent_states[layer_idx].dim(3)?;
+                    let rec_zeros = Tensor::zeros(
+                        (1, rec_heads, rec_h, rec_w),
+                        self.recurrent_states[layer_idx].dtype(),
+                        self.recurrent_states[layer_idx].device(),
+                    )?;
+                    scatter_rows_accel(
+                        &self.recurrent_states[layer_idx],
+                        &slot_tensor,
+                        &rec_zeros,
+                    )?;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
 
-        #[cfg(not(feature = "cuda"))]
-        {
-            for layer_idx in 0..self.num_gdn_layers {
-                let conv_dim = self.conv_states[layer_idx].dim(1)?;
-                let conv_window = self.conv_states[layer_idx].dim(2)?;
-                let conv_zeros = Tensor::zeros(
-                    (1, conv_dim, conv_window),
-                    self.conv_states[layer_idx].dtype(),
-                    self.conv_states[layer_idx].device(),
-                )?;
-                let conv_updated = self.conv_states[layer_idx]
-                    .slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &conv_zeros)?;
-                self.conv_states[layer_idx] = conv_updated;
+        for layer_idx in 0..self.num_gdn_layers {
+            let conv_dim = self.conv_states[layer_idx].dim(1)?;
+            let conv_window = self.conv_states[layer_idx].dim(2)?;
+            let conv_zeros = Tensor::zeros(
+                (1, conv_dim, conv_window),
+                self.conv_states[layer_idx].dtype(),
+                self.conv_states[layer_idx].device(),
+            )?;
+            let conv_updated = self.conv_states[layer_idx]
+                .slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &conv_zeros)?;
+            self.conv_states[layer_idx] = conv_updated;
 
-                let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
-                let rec_h = self.recurrent_states[layer_idx].dim(2)?;
-                let rec_w = self.recurrent_states[layer_idx].dim(3)?;
-                let rec_zeros = Tensor::zeros(
-                    (1, rec_heads, rec_h, rec_w),
-                    self.recurrent_states[layer_idx].dtype(),
-                    self.recurrent_states[layer_idx].device(),
-                )?;
-                let rec_updated = self.recurrent_states[layer_idx].slice_assign(
-                    &[slot..slot + 1, 0..rec_heads, 0..rec_h, 0..rec_w],
-                    &rec_zeros,
-                )?;
-                self.recurrent_states[layer_idx] = rec_updated;
-            }
-            Ok(())
+            let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
+            let rec_h = self.recurrent_states[layer_idx].dim(2)?;
+            let rec_w = self.recurrent_states[layer_idx].dim(3)?;
+            let rec_zeros = Tensor::zeros(
+                (1, rec_heads, rec_h, rec_w),
+                self.recurrent_states[layer_idx].dtype(),
+                self.recurrent_states[layer_idx].device(),
+            )?;
+            let rec_updated = self.recurrent_states[layer_idx].slice_assign(
+                &[slot..slot + 1, 0..rec_heads, 0..rec_h, 0..rec_w],
+                &rec_zeros,
+            )?;
+            self.recurrent_states[layer_idx] = rec_updated;
         }
+        Ok(())
     }
 
     /// Get the conv state tensor for a given GDN layer and slot
@@ -538,25 +608,25 @@ impl MambaCache {
         slots: &Tensor,
         batch_state: &Tensor,
     ) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            return scatter_rows_cuda(&self.conv_states[gdn_layer_idx], slots, batch_state);
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        if matches!(
+            self.conv_states[gdn_layer_idx].device(),
+            Device::Cuda(_) | Device::Metal(_)
+        ) {
+            return scatter_rows_accel(&self.conv_states[gdn_layer_idx], slots, batch_state);
         }
 
-        #[cfg(not(feature = "cuda"))]
-        {
-            let slots_vec = slots.to_vec1::<i64>()?;
-            let conv_dim = self.conv_states[gdn_layer_idx].dim(1)?;
-            let conv_window = self.conv_states[gdn_layer_idx].dim(2)?;
-            for (i, &slot) in slots_vec.iter().enumerate() {
-                let s = slot as usize;
-                let b_slice = batch_state.narrow(0, i, 1)?;
-                let updated = self.conv_states[gdn_layer_idx]
-                    .slice_assign(&[s..s + 1, 0..conv_dim, 0..conv_window], &b_slice)?;
-                self.conv_states[gdn_layer_idx] = updated;
-            }
-            Ok(())
+        let slots_vec = slots.to_vec1::<i64>()?;
+        let conv_dim = self.conv_states[gdn_layer_idx].dim(1)?;
+        let conv_window = self.conv_states[gdn_layer_idx].dim(2)?;
+        for (i, &slot) in slots_vec.iter().enumerate() {
+            let s = slot as usize;
+            let b_slice = batch_state.narrow(0, i, 1)?;
+            let updated = self.conv_states[gdn_layer_idx]
+                .slice_assign(&[s..s + 1, 0..conv_dim, 0..conv_window], &b_slice)?;
+            self.conv_states[gdn_layer_idx] = updated;
         }
+        Ok(())
     }
 
     pub fn get_batch_recurrent_state(
@@ -582,26 +652,26 @@ impl MambaCache {
         slots: &Tensor,
         batch_state: &Tensor,
     ) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            return scatter_rows_cuda(&self.recurrent_states[gdn_layer_idx], slots, batch_state);
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        if matches!(
+            self.recurrent_states[gdn_layer_idx].device(),
+            Device::Cuda(_) | Device::Metal(_)
+        ) {
+            return scatter_rows_accel(&self.recurrent_states[gdn_layer_idx], slots, batch_state);
         }
 
-        #[cfg(not(feature = "cuda"))]
-        {
-            let slots_vec = slots.to_vec1::<i64>()?;
-            let rec_heads = self.recurrent_states[gdn_layer_idx].dim(1)?;
-            let rec_h = self.recurrent_states[gdn_layer_idx].dim(2)?;
-            let rec_w = self.recurrent_states[gdn_layer_idx].dim(3)?;
-            for (i, &slot) in slots_vec.iter().enumerate() {
-                let s = slot as usize;
-                let b_slice = batch_state.narrow(0, i, 1)?;
-                let updated = self.recurrent_states[gdn_layer_idx]
-                    .slice_assign(&[s..s + 1, 0..rec_heads, 0..rec_h, 0..rec_w], &b_slice)?;
-                self.recurrent_states[gdn_layer_idx] = updated;
-            }
-            Ok(())
+        let slots_vec = slots.to_vec1::<i64>()?;
+        let rec_heads = self.recurrent_states[gdn_layer_idx].dim(1)?;
+        let rec_h = self.recurrent_states[gdn_layer_idx].dim(2)?;
+        let rec_w = self.recurrent_states[gdn_layer_idx].dim(3)?;
+        for (i, &slot) in slots_vec.iter().enumerate() {
+            let s = slot as usize;
+            let b_slice = batch_state.narrow(0, i, 1)?;
+            let updated = self.recurrent_states[gdn_layer_idx]
+                .slice_assign(&[s..s + 1, 0..rec_heads, 0..rec_h, 0..rec_w], &b_slice)?;
+            self.recurrent_states[gdn_layer_idx] = updated;
         }
+        Ok(())
     }
 
     /// Get the slot index for a sequence

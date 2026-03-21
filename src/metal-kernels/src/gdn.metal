@@ -356,7 +356,8 @@ kernel void gated_delta_rule_recurrence_kernel(
     const device T* v_bh = v + bh_idx * seq_len * v_dim;
     const device float* g_bh = g + bh_idx * seq_len;
     const device float* beta_bh = beta + bh_idx * seq_len;
-    device float* state_bh = state + (bh_idx * BK * v_dim) + v_idx;
+    // State layout: [V, K] — each thread owns one contiguous K-row for its v_idx
+    device float* state_bh = state + (bh_idx * BK * v_dim) + v_idx * BK;
     device T* out_bh = out + bh_idx * seq_len * v_dim;
 
     threadgroup float k_shared[BK];
@@ -365,7 +366,7 @@ kernel void gated_delta_rule_recurrence_kernel(
 
     float s[BK];
     for (uint j = 0; j < BK; ++j) {
-        s[j] = state_bh[j * v_dim];
+        s[j] = state_bh[j];
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -373,7 +374,8 @@ kernel void gated_delta_rule_recurrence_kernel(
             k_shared[j] = gdn_to_float(k_bh[t * BK + j]);
         }
         if (tid == 0) {
-            scalars[0] = exp(g_bh[t]);
+            // g is pre-computed decay = exp(g) by caller
+            scalars[0] = g_bh[t];
             scalars[1] = beta_bh[t];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -404,7 +406,7 @@ kernel void gated_delta_rule_recurrence_kernel(
     }
 
     for (uint j = 0; j < BK; ++j) {
-        state_bh[j * v_dim] = s[j];
+        state_bh[j] = s[j];
     }
 }
 
@@ -447,7 +449,8 @@ kernel void gated_delta_rule_decode_slots_kernel(
     const device T* k_bh = k + bh * k_dim;
     const device T* v_bh = v + bh * v_dim;
     if (tid == 0) {
-        scalars[0] = exp(gdn_to_float(g[bh]));
+        // g is pre-computed decay = exp(g) by caller
+        scalars[0] = gdn_to_float(g[bh]);
         scalars[1] = gdn_to_float(beta[bh]);
     }
     for (uint j = tid; j < static_cast<uint>(k_dim); j += GDN_REC_THREADS) {
@@ -455,10 +458,11 @@ kernel void gated_delta_rule_decode_slots_kernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float* state_bh = state + (((static_cast<uint>(slot) * heads + h) * k_dim) * v_dim) + v_idx;
+    // State layout: [V, K] — contiguous K-row per v_idx
+    device float* state_bh = state + (((static_cast<uint>(slot) * heads + h) * v_dim + v_idx) * k_dim);
     float s[BK];
     for (uint j = 0; j < BK; ++j) {
-        s[j] = j < static_cast<uint>(k_dim) ? state_bh[j * v_dim] : 0.0f;
+        s[j] = j < static_cast<uint>(k_dim) ? state_bh[j] : 0.0f;
     }
 
     const float decay = scalars[0];
@@ -483,7 +487,7 @@ kernel void gated_delta_rule_decode_slots_kernel(
         if (j < static_cast<uint>(k_dim)) {
             s[j] += k_shared[j] * delta;
             y += s[j] * q_shared[j];
-            state_bh[j * v_dim] = s[j];
+            state_bh[j] = s[j];
         }
     }
     out[bh * v_dim + v_idx] = gdn_from_float<T>(y);
@@ -536,10 +540,11 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     threadgroup float q_shared[BK];
     threadgroup float scalars[2];
 
-    device float* state_bh = state + (((static_cast<uint>(slot) * num_heads + head_idx) * k_dim) * v_dim) + v_idx;
+    // State layout: [V, K] — contiguous K-row per v_idx
+    device float* state_bh = state + (((static_cast<uint>(slot) * num_heads + head_idx) * v_dim + v_idx) * k_dim);
     float s[BK];
     for (uint j = 0; j < BK; ++j) {
-        s[j] = state_bh[j * v_dim];
+        s[j] = state_bh[j];
     }
 
     for (uint t = 0; t < seq_len; ++t) {
@@ -552,7 +557,8 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
             k_shared[j] = gdn_to_float(k[qk_base + j]);
         }
         if (tid == 0) {
-            scalars[0] = exp(gdn_to_float(g[g_base]));
+            // g is pre-computed decay = exp(g) by caller
+            scalars[0] = gdn_to_float(g[g_base]);
             scalars[1] = gdn_to_float(beta[g_base]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -581,7 +587,7 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     }
 
     for (uint j = 0; j < BK; ++j) {
-        state_bh[j * v_dim] = s[j];
+        state_bh[j] = s[j];
     }
 }
 

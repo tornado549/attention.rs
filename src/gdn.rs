@@ -560,9 +560,9 @@ pub fn gated_delta_rule_recurrence(
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
     let g_f32 = if g.dtype() == DType::F32 {
-        ensure_contiguous(g)?
+        ensure_contiguous(g)?.exp()?.contiguous()?
     } else {
-        g.to_dtype(DType::F32)?.contiguous()?
+        g.to_dtype(DType::F32)?.exp()?.contiguous()?
     };
     let beta_f32 = if beta.dtype() == DType::F32 {
         ensure_contiguous(beta)?
@@ -630,7 +630,7 @@ pub fn gated_delta_rule_decode_slots(
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
-    let g_c = ensure_contiguous(g)?;
+    let g_c = ensure_contiguous(g)?.exp()?.contiguous()?;
     let beta_c = ensure_contiguous(beta)?;
     let slots_c = if slots.dtype() == DType::I64 {
         ensure_contiguous(slots)?
@@ -702,7 +702,7 @@ pub fn gated_delta_rule_recurrence_varlen(
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
-    let g_c = ensure_contiguous(g)?;
+    let g_c = ensure_contiguous(g)?.exp()?.contiguous()?;
     let beta_c = ensure_contiguous(beta)?;
     let slots_c = if slots.dtype() == DType::I64 {
         ensure_contiguous(slots)?

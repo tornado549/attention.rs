@@ -1137,6 +1137,34 @@ extern "C" {
         stream: i64,
     );
 
+    // pub fn choreo_moe_fp8_stage_bf16_sm90(
+    //     input: *const c_void,
+    //     weights: *const u8,
+    //     weight_scales: *const f32,
+    //     sorted_token_ids: *const i32,
+    //     expert_ids: *const i32,
+    //     topk_weights: *const f32,
+    //     input_q: *mut c_void,
+    //     input_scale: *mut f32,
+    //     rep_a_q: *mut c_void,
+    //     rep_a_scales: *mut f32,
+    //     rep_out: *mut c_void,
+    //     output: *mut c_void,
+    //     expert_counts: *mut i32,
+    //     expert_offsets: *mut i32,
+    //     num_experts: c_int,
+    //     topk: c_int,
+    //     input_rows: c_int,
+    //     size_m: c_int,
+    //     size_n: c_int,
+    //     size_k: c_int,
+    //     block_size_n: c_int,
+    //     block_size_k: c_int,
+    //     is_prefill: bool,
+    //     sm_version: c_int,
+    //     stream: i64,
+    // );
+
     pub fn fp8_quantize_per_token_group_launch(
         input: *const c_void,
         output_q: *mut c_void,
@@ -1147,6 +1175,103 @@ extern "C" {
         scale_stride: c_int,
         is_input_f16: bool,
         is_column_major_stats: bool,
+        stream: i64,
+    );
+
+    pub fn choreo_fp8_quantize_per_token_group(
+        input: *const c_void,
+        output_q: *mut c_void,
+        output_s: *mut f32,
+        num_groups: c_int,
+        group_size: c_int,
+        num_groups_per_row: c_int,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_count_experts(
+        topk_ids: *const i32,
+        expert_counts: *mut i32,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_build_layout(
+        expert_counts: *const i32,
+        expert_offsets: *mut i32,
+        expert_write_offsets: *mut i32,
+        num_experts: c_int,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_sort_and_gather(
+        input_q: *const u8,
+        input_scales: *const f32,
+        topk_ids: *const i32,
+        expert_write_offsets: *mut i32,
+        sorted_route_ids: *mut i32,
+        rep_a_q: *mut u8,
+        rep_a_scales: *mut f32,
+        num_tokens: c_int,
+        topk: c_int,
+        k: c_int,
+        num_experts: c_int,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_shuffle_and_gather(
+        input_q: *const u8,
+        input_scales: *const f32,
+        flat_topk_ids: *const i32,
+        expert_write_offsets: *mut i32,
+        sorted_route_ids: *mut i32,
+        rep_a_q: *mut u8,
+        rep_a_scales: *mut f32,
+        expanded_m: c_int,
+        k: c_int,
+        k_blocks: c_int,
+        num_experts: c_int,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_grouped_gemm_bf16(
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        b_scales: *const f32,
+        expert_offsets: *const i32,
+        num_experts: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        block_size_n: c_int,
+        block_size_k: c_int,
+        sm_version: c_int,
+        out: *mut c_void,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_unshuffle(
+        rep_out: *const c_void,
+        sorted_route_ids: *const i32,
+        output: *mut c_void,
+        total_sorted: c_int,
+        size_m: c_int,
+        n: c_int,
+        stream: i64,
+    );
+
+    pub fn choreo_moe_unshuffle_weighted(
+        rep_out: *const c_void,
+        sorted_route_ids: *const i32,
+        topk_weights: *const f32,
+        output: *mut c_void,
+        total_sorted: c_int,
+        size_m: c_int,
+        n: c_int,
+        num_tokens: c_int,
+        topk: c_int,
         stream: i64,
     );
 

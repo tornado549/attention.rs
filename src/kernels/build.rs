@@ -170,6 +170,12 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
     // println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-search=native=/home/wsj/dev/choreo");
+    // println!("cargo:rustc-link-search=native=/home/wsj/dev/choreo/co2deb/build/lib/temp");
+    println!("cargo:rustc-link-lib=fmquant");
+    // println!("cargo:rustc-link-lib=mygemm");
+    // println!("cargo:rustc-link-lib=dylib=mytopk");
+
 
     Ok(())
 }

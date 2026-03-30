@@ -138,7 +138,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
         #pragma unroll
         for (int j = 0; j < vec_size; ++j) {
-             float val;
+            float val;
             if constexpr (std::is_same_v<T, __half>) {
                 val = __half2float(ptr_T[j]);
             } else {
@@ -347,7 +347,6 @@ void cutlass_gemm_caller_blockwise(
   cutlass_gemm_caller<GemmKernel>(args, stream);
 }
 
-
 extern "C" void fp8_quantize_per_token_group_launch(
     const void* input,
     void* output_q,
@@ -405,7 +404,6 @@ extern "C" void fp8_quantize_per_token_group_launch(
         }
     }
 }
-
 
 template <typename T_Out>
 void fp8_gemm_launcher_sm90(

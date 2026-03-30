@@ -405,24 +405,11 @@ pub fn moe_gemm(
     }
 }
 
-/// MoE GEMM with FP8 weights and block-wise scales.
-///
-/// # Arguments
-/// * `input` - Input tensor [size_m, size_k] in F16/BF16
-/// * `weights` - FP8 weights as U8 tensor [num_experts, size_n, size_k]
-/// * `weight_scales` - Block-wise scales [num_experts, scale_n_dim, scale_k_dim] in F32
-/// * `topk_weights` - Optional per-token gating weights [size_m]
-/// * `sorted_token_ids` - Sorted token indices [size_m]
-/// * `experts_ids` - Expert IDs [size_m]
-/// * `topk` - Number of experts per token
-/// * `block_size_n` - Block size in N dimension for scales
-/// * `block_size_k` - Block size in K dimension for scales
-/// * `is_prefill` - Whether this is prefill (uses WMMA) or decode (uses GEMV)
 #[cfg(feature = "cuda")]
 pub fn moe_gemm_fp8(
     input: &Tensor,
-    weights: &Tensor,       // U8 tensor for FP8 weights
-    weight_scales: &Tensor, // F32 tensor for scales
+    weights: &Tensor,
+    weight_scales: &Tensor,
     topk_weights: &Option<Tensor>,
     sorted_token_ids: &Tensor,
     experts_ids: &Tensor,
@@ -430,6 +417,7 @@ pub fn moe_gemm_fp8(
     block_size_n: usize,
     block_size_k: usize,
     is_prefill: bool,
+    topk_ids: &Option<Tensor>,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
@@ -450,6 +438,7 @@ pub fn moe_gemm_fp8(
         block_size_n: usize,
         block_size_k: usize,
         is_prefill: bool,
+        topk_ids: &Option<Tensor>,
     ) -> Result<Tensor> {
         let (input_rows, size_k1) = input.dims2()?;
         let size_m = if topk_weights.is_none() {
@@ -544,17 +533,16 @@ pub fn moe_gemm_fp8(
                 let k_blocks = (size_k + block_size_k - 1) / block_size_k;
                 let num_groups_per_row = k_blocks;
                 let num_groups = (input_rows * num_groups_per_row) as i32;
-
-                // SM100+ (Blackwell) requires column-major scale layout (UMMA::Major::MN)
-                // SM90 (Hopper) requires row-major scale layout (GMMA::Major::K)
                 let is_column_major_scales = sm_version >= 100;
+
+                let use_choreo = !is_column_major_scales && data_type != 0
+                    && topk_ids.is_some()
+                    && (topk_weights.is_some() || size_m <= 8192);
 
                 let input_q = Tensor::zeros((input_rows, size_k), DType::U8, &device)?;
                 let input_scale = if is_column_major_scales {
-                    // Column-major: allocate transposed and transpose for column-major view
                     Tensor::zeros((k_blocks, input_rows), DType::F32, &device)?.t()?
                 } else {
-                    // Row-major: standard contiguous layout
                     Tensor::zeros((input_rows, k_blocks), DType::F32, &device)?
                 };
                 let rep_a_q = Tensor::zeros((size_m, size_k), DType::U8, &device)?;
@@ -570,12 +558,10 @@ pub fn moe_gemm_fp8(
                 } else {
                     1
                 };
-
-                // Get scale stride for quantization kernel
                 let input_scale_stride = if is_column_major_scales {
-                    input_rows as i32 // Column-major stride
+                    input_rows as i32
                 } else {
-                    num_groups_per_row as i32 // Row-major stride
+                    num_groups_per_row as i32
                 };
 
                 let (input_q, _) = input_q.storage_and_layout();
@@ -614,101 +600,102 @@ pub fn moe_gemm_fp8(
 
                 let stream = *dev.cu_stream() as i64;
                 use core::ffi::c_void;
-                unsafe {
-                    ffi::fp8_quantize_per_token_group_launch(
-                        *input.device_ptr() as *const c_void,
-                        *input_q.device_ptr() as *mut c_void,
-                        *input_scale.device_ptr() as *mut f32,
-                        num_groups as i32,
-                        128,
-                        num_groups_per_row as i32,
-                        input_scale_stride,
-                        data_type == 0,
-                        is_column_major_scales,
-                        stream as i64,
-                    );
 
-                    ffi::moe_fp8_shuffle_rows_u8(
-                        *input_q.device_ptr() as *const u8,
-                        *sorted_token_ids.device_ptr() as *const i32,
-                        *rep_a_q.device_ptr() as *mut u8,
-                        input_rows as i64,
-                        size_m as i64,
-                        size_k as i64,
-                        map_divisor,
-                        stream as i64,
-                    );
-
-                    // Use strided shuffle for column-major scales (SM100+ Blackwell)
-                    // or regular shuffle for row-major scales (SM90)
-                    if is_column_major_scales {
-                        ffi::moe_fp8_shuffle_rows_f32_strided(
-                            *input_scale.device_ptr() as *const f32,
-                            *sorted_token_ids.device_ptr() as *const i32,
-                            *rep_a_scales.device_ptr() as *mut f32,
-                            input_rows as i64,
-                            size_m as i64,
-                            num_groups_per_row as i64,
-                            input_rows as i64, // src_row_stride (column-major)
-                            size_m as i64,     // dst_row_stride (column-major)
-                            map_divisor,
-                            stream as i64,
-                        );
+                if use_choreo {
+                    let topk_ids_t = topk_ids.as_ref().unwrap();
+                    let (topk_ids_s, _) = topk_ids_t.storage_and_layout();
+                    let topk_ids_ptr = match &*topk_ids_s {
+                        candle::Storage::Cuda(c) => {
+                            *c.as_cuda_slice::<u32>()?.device_ptr() as *const i32
+                        }
+                        _ => candle::bail!("topk_ids must be a cuda tensor"),
+                    };
+                    let num_tokens = if topk_weights.is_none() {
+                        input_rows
                     } else {
-                        ffi::moe_fp8_shuffle_rows_f32(
-                            *input_scale.device_ptr() as *const f32,
-                            *sorted_token_ids.device_ptr() as *const i32,
-                            *rep_a_scales.device_ptr() as *mut f32,
-                            input_rows as i64,
-                            size_m as i64,
-                            num_groups_per_row as i64,
-                            map_divisor,
-                            stream as i64,
+                        input_rows / topk
+                    };
+
+                    let expert_write_offsets =
+                        unsafe { dev.alloc::<i32>(num_experts).w()? };
+                    // sort_and_gather kernel uses QWEN35_MAX_SORTED_ROUTES=8192
+                    let max_sorted: usize = 8192;
+                    let buf_rows = std::cmp::max(size_m, max_sorted);
+                    let sorted_route_ids =
+                        unsafe { dev.alloc::<i32>(buf_rows).w()? };
+                    // Separate buffers sized for the sort kernel's hardcoded dim
+                    let c_rep_a_q =
+                        unsafe { dev.alloc::<u8>(buf_rows * size_k).w()? };
+                    let c_rep_a_scales =
+                        unsafe { dev.alloc::<f32>(buf_rows * k_blocks).w()? };
+
+                    unsafe {
+                        // 1. Quantize
+                        ffi::choreo_fp8_quantize_per_token_group(
+                            *input.device_ptr() as *const c_void,
+                            *input_q.device_ptr() as *mut c_void,
+                            *input_scale.device_ptr() as *mut f32,
+                            num_groups as i32,
+                            128,
+                            num_groups_per_row as i32,
+                            stream,
                         );
-                    }
 
-                    ffi::moe_fp8_calculate_expert_offsets(
-                        *experts_ids.device_ptr() as *const i32,
-                        *expert_counts.device_ptr() as *mut i32,
-                        *expert_offsets.device_ptr() as *mut i32,
-                        num_experts as i32,
-                        size_m as i32,
-                        is_prefill,
-                        stream as i64,
-                    );
-
-                    if data_type == 0 {
-                        ffi::moe_fp8_grouped_gemm_f16(
-                            *rep_a_q.device_ptr() as *const u8,
-                            *weights.device_ptr() as *const u8,
-                            *rep_a_scales.device_ptr() as *const f32,
-                            *weight_scales.device_ptr() as *const f32,
-                            *expert_offsets.device_ptr() as *const i32,
+                        // 2. Count experts + build layout
+                        ffi::choreo_moe_count_experts(
+                            topk_ids_ptr,
+                            *expert_counts.device_ptr() as *mut i32,
+                            num_tokens as i32,
+                            topk as i32,
                             num_experts as i32,
-                            size_m as i32,
-                            size_n as i32,
-                            size_k as i32,
-                            block_size_n as i32,
-                            block_size_k as i32,
-                            sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
-                            stream as i64,
+                            stream,
                         );
-                        ffi::moe_fp8_scatter_rows_f16(
-                            *rep_out.device_ptr() as *const c_void,
-                            *sorted_token_ids.device_ptr() as *const i32,
-                            *output.device_ptr() as *mut c_void,
-                            size_m as i64,
-                            size_m as i64,
-                            size_n as i64,
-                            topk_weights_ptr,
-                            stream as i64,
+                        ffi::choreo_moe_build_layout(
+                            *expert_counts.device_ptr() as *const i32,
+                            *expert_offsets.device_ptr() as *mut i32,
+                            *expert_write_offsets.device_ptr() as *mut i32,
+                            num_experts as i32,
+                            stream,
                         );
-                    } else {
+
+                        // 3. Sort/shuffle by expert
+                        if topk_weights.is_none() {
+                            ffi::choreo_moe_sort_and_gather(
+                                *input_q.device_ptr() as *const u8,
+                                *input_scale.device_ptr() as *const f32,
+                                topk_ids_ptr,
+                                *expert_write_offsets.device_ptr() as *mut i32,
+                                *sorted_route_ids.device_ptr() as *mut i32,
+                                *c_rep_a_q.device_ptr() as *mut u8,
+                                *c_rep_a_scales.device_ptr() as *mut f32,
+                                num_tokens as i32,
+                                topk as i32,
+                                size_k as i32,
+                                num_experts as i32,
+                                stream,
+                            );
+                        } else {
+                            ffi::choreo_moe_shuffle_and_gather(
+                                *input_q.device_ptr() as *const u8,
+                                *input_scale.device_ptr() as *const f32,
+                                topk_ids_ptr,
+                                *expert_write_offsets.device_ptr() as *mut i32,
+                                *sorted_route_ids.device_ptr() as *mut i32,
+                                *c_rep_a_q.device_ptr() as *mut u8,
+                                *c_rep_a_scales.device_ptr() as *mut f32,
+                                size_m as i32,
+                                size_k as i32,
+                                k_blocks as i32,
+                                num_experts as i32,
+                                stream,
+                            );
+                        }
+
+                        // 4. Grouped GEMM
                         ffi::moe_fp8_grouped_gemm_bf16(
-                            *rep_a_q.device_ptr() as *const u8,
+                            *c_rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
-                            *rep_a_scales.device_ptr() as *const f32,
+                            *c_rep_a_scales.device_ptr() as *const f32,
                             *weight_scales.device_ptr() as *const f32,
                             *expert_offsets.device_ptr() as *const i32,
                             num_experts as i32,
@@ -719,18 +706,151 @@ pub fn moe_gemm_fp8(
                             block_size_k as i32,
                             sm_version as i32,
                             *rep_out.device_ptr() as *mut c_void,
-                            stream as i64,
+                            stream,
                         );
-                        ffi::moe_fp8_scatter_rows_bf16(
-                            *rep_out.device_ptr() as *const c_void,
+
+                        // 5. Unshuffle
+                        if topk_weights.is_none() {
+                            ffi::choreo_moe_unshuffle(
+                                *rep_out.device_ptr() as *const c_void,
+                                *sorted_route_ids.device_ptr() as *const i32,
+                                *output.device_ptr() as *mut c_void,
+                                size_m as i32,
+                                size_m as i32,
+                                size_n as i32,
+                                stream,
+                            );
+                        } else {
+                            ffi::choreo_moe_unshuffle_weighted(
+                                *rep_out.device_ptr() as *const c_void,
+                                *sorted_route_ids.device_ptr() as *const i32,
+                                topk_weights_ptr,
+                                *output.device_ptr() as *mut c_void,
+                                size_m as i32,
+                                size_m as i32,
+                                size_n as i32,
+                                num_tokens as i32,
+                                topk as i32,
+                                stream,
+                            );
+                        }
+                    }
+                } else {
+                    unsafe {
+                        ffi::fp8_quantize_per_token_group_launch(
+                            *input.device_ptr() as *const c_void,
+                            *input_q.device_ptr() as *mut c_void,
+                            *input_scale.device_ptr() as *mut f32,
+                            num_groups as i32,
+                            128,
+                            num_groups_per_row as i32,
+                            input_scale_stride,
+                            data_type == 0,
+                            is_column_major_scales,
+                            stream,
+                        );
+
+                        ffi::moe_fp8_shuffle_rows_u8(
+                            *input_q.device_ptr() as *const u8,
                             *sorted_token_ids.device_ptr() as *const i32,
-                            *output.device_ptr() as *mut c_void,
+                            *rep_a_q.device_ptr() as *mut u8,
+                            input_rows as i64,
                             size_m as i64,
-                            size_m as i64,
-                            size_n as i64,
-                            topk_weights_ptr,
-                            stream as i64,
+                            size_k as i64,
+                            map_divisor,
+                            stream,
                         );
+                        if is_column_major_scales {
+                            ffi::moe_fp8_shuffle_rows_f32_strided(
+                                *input_scale.device_ptr() as *const f32,
+                                *sorted_token_ids.device_ptr() as *const i32,
+                                *rep_a_scales.device_ptr() as *mut f32,
+                                input_rows as i64,
+                                size_m as i64,
+                                num_groups_per_row as i64,
+                                input_rows as i64,
+                                size_m as i64,
+                                map_divisor,
+                                stream,
+                            );
+                        } else {
+                            ffi::moe_fp8_shuffle_rows_f32(
+                                *input_scale.device_ptr() as *const f32,
+                                *sorted_token_ids.device_ptr() as *const i32,
+                                *rep_a_scales.device_ptr() as *mut f32,
+                                input_rows as i64,
+                                size_m as i64,
+                                num_groups_per_row as i64,
+                                map_divisor,
+                                stream,
+                            );
+                        }
+
+                        ffi::moe_fp8_calculate_expert_offsets(
+                            *experts_ids.device_ptr() as *const i32,
+                            *expert_counts.device_ptr() as *mut i32,
+                            *expert_offsets.device_ptr() as *mut i32,
+                            num_experts as i32,
+                            size_m as i32,
+                            is_prefill,
+                            stream,
+                        );
+
+                        if data_type == 0 {
+                            ffi::moe_fp8_grouped_gemm_f16(
+                                *rep_a_q.device_ptr() as *const u8,
+                                *weights.device_ptr() as *const u8,
+                                *rep_a_scales.device_ptr() as *const f32,
+                                *weight_scales.device_ptr() as *const f32,
+                                *expert_offsets.device_ptr() as *const i32,
+                                num_experts as i32,
+                                size_m as i32,
+                                size_n as i32,
+                                size_k as i32,
+                                block_size_n as i32,
+                                block_size_k as i32,
+                                sm_version as i32,
+                                *rep_out.device_ptr() as *mut c_void,
+                                stream,
+                            );
+                            ffi::moe_fp8_scatter_rows_f16(
+                                *rep_out.device_ptr() as *const c_void,
+                                *sorted_token_ids.device_ptr() as *const i32,
+                                *output.device_ptr() as *mut c_void,
+                                size_m as i64,
+                                size_m as i64,
+                                size_n as i64,
+                                topk_weights_ptr,
+                                stream,
+                            );
+                        } else {
+                            ffi::moe_fp8_grouped_gemm_bf16(
+                                *rep_a_q.device_ptr() as *const u8,
+                                *weights.device_ptr() as *const u8,
+                                *rep_a_scales.device_ptr() as *const f32,
+                                *weight_scales.device_ptr() as *const f32,
+                                *expert_offsets.device_ptr() as *const i32,
+                                num_experts as i32,
+                                size_m as i32,
+                                size_n as i32,
+                                size_k as i32,
+                                block_size_n as i32,
+                                block_size_k as i32,
+                                sm_version as i32,
+                                *rep_out.device_ptr() as *mut c_void,
+                                stream,
+                            );
+                            ffi::moe_fp8_scatter_rows_bf16(
+                                *rep_out.device_ptr() as *const c_void,
+                                *sorted_token_ids.device_ptr() as *const i32,
+                                *output.device_ptr() as *mut c_void,
+                                size_m as i64,
+                                size_m as i64,
+                                size_n as i64,
+                                topk_weights_ptr,
+                                stream,
+                            );
+                        }
                     }
                 }
 
@@ -810,6 +930,7 @@ pub fn moe_gemm_fp8(
             block_size_n,
             block_size_k,
             is_prefill,
+            topk_ids,
         ),
         DType::BF16 => cuda_fwd::<bf16>(
             input,
@@ -822,6 +943,7 @@ pub fn moe_gemm_fp8(
             block_size_n,
             block_size_k,
             is_prefill,
+            topk_ids,
         ),
         _ => {
             candle_core::bail!("moe_gemm_fp8 only accepts f16/bf16 inputs!")
@@ -841,6 +963,7 @@ pub fn moe_gemm_fp8(
     _: usize,
     _: usize,
     _: bool,
+    _: &Option<Tensor>,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")
 }

@@ -535,8 +535,13 @@ pub fn moe_gemm_fp8(
                 let num_groups = (input_rows * num_groups_per_row) as i32;
                 let is_column_major_scales = sm_version >= 100;
 
+                let choreo_dims_match = size_k == 2048
+                    && block_size_n == 128 && block_size_k == 128
+                    && num_experts == 256
+                    && size_n % 128 == 0;
                 let use_choreo = !is_column_major_scales && data_type != 0
                     && topk_ids.is_some()
+                    && choreo_dims_match
                     && (topk_weights.is_some() || size_m <= 8192);
 
                 let input_q = Tensor::zeros((input_rows, size_k), DType::U8, &device)?;
@@ -630,39 +635,22 @@ pub fn moe_gemm_fp8(
                         unsafe { dev.alloc::<f32>(buf_rows * k_blocks).w()? };
 
                     unsafe {
-                        // 1. Quantize
-                        ffi::choreo_fp8_quantize_per_token_group(
-                            *input.device_ptr() as *const c_void,
-                            *input_q.device_ptr() as *mut c_void,
-                            *input_scale.device_ptr() as *mut f32,
-                            num_groups as i32,
-                            128,
-                            num_groups_per_row as i32,
-                            stream,
-                        );
-
-                        // 2. Count experts + build layout
-                        ffi::choreo_moe_count_experts(
+                        // 1. Fused count experts + build layout
+                        ffi::choreo_moe_count_and_build(
                             topk_ids_ptr,
-                            *expert_counts.device_ptr() as *mut i32,
+                            *expert_offsets.device_ptr() as *mut i32,
+                            *expert_write_offsets.device_ptr() as *mut i32,
                             num_tokens as i32,
                             topk as i32,
                             num_experts as i32,
                             stream,
                         );
-                        ffi::choreo_moe_build_layout(
-                            *expert_counts.device_ptr() as *const i32,
-                            *expert_offsets.device_ptr() as *mut i32,
-                            *expert_write_offsets.device_ptr() as *mut i32,
-                            num_experts as i32,
-                            stream,
-                        );
 
-                        // 3. Sort/shuffle by expert
+                        // 2. Quantize + sort/shuffle by expert
                         if topk_weights.is_none() {
-                            ffi::choreo_moe_sort_and_gather(
-                                *input_q.device_ptr() as *const u8,
-                                *input_scale.device_ptr() as *const f32,
+                            // Gate-up: fused quantize + sort + gather (transposed scales)
+                            ffi::choreo_moe_quant_sort_gather(
+                                *input.device_ptr() as *const c_void,
                                 topk_ids_ptr,
                                 *expert_write_offsets.device_ptr() as *mut i32,
                                 *sorted_route_ids.device_ptr() as *mut i32,
@@ -675,6 +663,16 @@ pub fn moe_gemm_fp8(
                                 stream,
                             );
                         } else {
+                            // Down: quantize then shuffle (transposed scales)
+                            ffi::choreo_fp8_quantize_per_token_group(
+                                *input.device_ptr() as *const c_void,
+                                *input_q.device_ptr() as *mut c_void,
+                                *input_scale.device_ptr() as *mut f32,
+                                num_groups as i32,
+                                128,
+                                num_groups_per_row as i32,
+                                stream,
+                            );
                             ffi::choreo_moe_shuffle_and_gather(
                                 *input_q.device_ptr() as *const u8,
                                 *input_scale.device_ptr() as *const f32,
@@ -691,8 +689,12 @@ pub fn moe_gemm_fp8(
                             );
                         }
 
-                        // 4. Grouped GEMM
-                        ffi::moe_fp8_grouped_gemm_bf16(
+                        // Gate-up only (topk_weights.is_none()):
+                        // Choreo WGMMA uses buf_rows (8192) for all M-dim spanviews
+                        let c_rep_out = unsafe {
+                            dev.alloc::<T>(buf_rows * size_n).w()?
+                        };
+                        ffi::choreo_moe_grouped_gemm_bf16(
                             *c_rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *c_rep_a_scales.device_ptr() as *const f32,
@@ -705,35 +707,18 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            *c_rep_out.device_ptr() as *mut c_void,
                             stream,
                         );
-
-                        // 5. Unshuffle
-                        if topk_weights.is_none() {
-                            ffi::choreo_moe_unshuffle(
-                                *rep_out.device_ptr() as *const c_void,
-                                *sorted_route_ids.device_ptr() as *const i32,
-                                *output.device_ptr() as *mut c_void,
-                                size_m as i32,
-                                size_m as i32,
-                                size_n as i32,
-                                stream,
-                            );
-                        } else {
-                            ffi::choreo_moe_unshuffle_weighted(
-                                *rep_out.device_ptr() as *const c_void,
-                                *sorted_route_ids.device_ptr() as *const i32,
-                                topk_weights_ptr,
-                                *output.device_ptr() as *mut c_void,
-                                size_m as i32,
-                                size_m as i32,
-                                size_n as i32,
-                                num_tokens as i32,
-                                topk as i32,
-                                stream,
-                            );
-                        }
+                        ffi::choreo_moe_unshuffle(
+                            *c_rep_out.device_ptr() as *const c_void,
+                            *sorted_route_ids.device_ptr() as *const i32,
+                            *output.device_ptr() as *mut c_void,
+                            size_m as i32,
+                            size_m as i32,
+                            size_n as i32,
+                            stream,
+                        );
                     }
                 } else {
                     unsafe {

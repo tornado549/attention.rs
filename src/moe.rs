@@ -535,14 +535,19 @@ pub fn moe_gemm_fp8(
                 let num_groups = (input_rows * num_groups_per_row) as i32;
                 let is_column_major_scales = sm_version >= 100;
 
-                let choreo_dims_match = size_k == 2048
+                let choreo_dims_match = (size_k == 2048 || size_k == 512)
                     && block_size_n == 128 && block_size_k == 128
                     && num_experts == 256
                     && size_n % 128 == 0;
+                let choreo_num_tokens = if topk_weights.is_none() {
+                    input_rows
+                } else {
+                    input_rows / topk
+                };
                 let use_choreo = !is_column_major_scales && data_type != 0
                     && topk_ids.is_some()
                     && choreo_dims_match
-                    && (topk_weights.is_some() || size_m <= 8192);
+                    && choreo_num_tokens <= 4096;
 
                 let input_q = Tensor::zeros((input_rows, size_k), DType::U8, &device)?;
                 let input_scale = if is_column_major_scales {

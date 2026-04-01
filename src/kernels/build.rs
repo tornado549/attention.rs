@@ -3,7 +3,7 @@ use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    // rebuild trigger: opt3 remove debug cudaMemcpy, use M*topk for total
+    // rebuild trigger: k512 support for down GEMM path
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
@@ -178,7 +178,6 @@ fn main() -> Result<()> {
     // println!("cargo:rustc-link-lib=dylib=mytopk");
 
     // touch: force relink for libfmquant.a rebuild (baseline isolation test)
-    
     Ok(())
 }
 

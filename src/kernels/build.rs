@@ -3,6 +3,7 @@ use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    // rebuild trigger: RENORMALIZE=false fix
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
@@ -176,8 +177,7 @@ fn main() -> Result<()> {
     // println!("cargo:rustc-link-lib=mygemm");
     // println!("cargo:rustc-link-lib=dylib=mytopk");
 
-
-    // touch: force relink for libfmquant.a rebuild (cudaDeviceSynchronize removed)
+    // touch: force relink for libfmquant.a rebuild (baseline isolation test)
     
     Ok(())
 }

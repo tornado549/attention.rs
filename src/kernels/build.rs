@@ -3,7 +3,7 @@ use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    // rebuild trigger: opt1 use fused_moe_build_layout from counts
+    // rebuild trigger: opt2 remove inter-kernel sync barriers
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");

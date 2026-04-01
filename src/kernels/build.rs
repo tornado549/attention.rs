@@ -175,5 +175,13 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-lib=fmquant");
     // println!("cargo:rustc-link-lib=mygemm");
     // println!("cargo:rustc-link-lib=dylib=mytopk");
+
+
+    // touch: force relink for libfmquant.a rebuild (cudaDeviceSynchronize removed)
+    
     Ok(())
 }
+
+
+
+

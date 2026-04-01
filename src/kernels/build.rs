@@ -3,7 +3,7 @@ use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    // rebuild trigger: opt2 remove inter-kernel sync barriers
+    // rebuild trigger: opt3 remove debug cudaMemcpy, use M*topk for total
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");

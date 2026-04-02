@@ -1137,6 +1137,34 @@ extern "C" {
         stream: i64,
     );
 
+    // pub fn choreo_moe_fp8_stage_bf16_sm90(
+    //     input: *const c_void,
+    //     weights: *const u8,
+    //     weight_scales: *const f32,
+    //     sorted_token_ids: *const i32,
+    //     expert_ids: *const i32,
+    //     topk_weights: *const f32,
+    //     input_q: *mut c_void,
+    //     input_scale: *mut f32,
+    //     rep_a_q: *mut c_void,
+    //     rep_a_scales: *mut f32,
+    //     rep_out: *mut c_void,
+    //     output: *mut c_void,
+    //     expert_counts: *mut i32,
+    //     expert_offsets: *mut i32,
+    //     num_experts: c_int,
+    //     topk: c_int,
+    //     input_rows: c_int,
+    //     size_m: c_int,
+    //     size_n: c_int,
+    //     size_k: c_int,
+    //     block_size_n: c_int,
+    //     block_size_k: c_int,
+    //     is_prefill: bool,
+    //     sm_version: c_int,
+    //     stream: i64,
+    // );
+
     pub fn fp8_quantize_per_token_group_launch(
         input: *const c_void,
         output_q: *mut c_void,
@@ -1149,6 +1177,48 @@ extern "C" {
         is_column_major_stats: bool,
         stream: i64,
     );
+
+    // --- Choreo fused MoE: 4 wrappers matching launch_end_to_end ---
+
+    pub fn choreo_fused_moe_route(
+        gating_output: *const f32,
+        topk_ids: *mut i32,
+        topk_weights: *mut f32,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn choreo_fused_moe_build_layout(
+        topk_ids: *const i32,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn choreo_fused_moe_quant_sort_gather(
+        input: *const c_void,
+        topk_ids: *const i32,
+        num_tokens: c_int,
+        k: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn choreo_fused_moe_grouped_wgmma(
+        expert_weights: *const u8,
+        expert_scales: *const f32,
+        topk_weights: *const f32,
+        num_tokens: c_int,
+        n: c_int,
+        k: c_int,
+        num_experts: c_int,
+        output: *mut c_void,
+        stream: i64,
+    ) -> c_int;
 
     pub fn flashinfer_fp8_quantize_q_per_head(
         input: *const c_void,

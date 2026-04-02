@@ -469,6 +469,7 @@ __global__ void moe_gemm_grouped_kernel_fp8(
         block_size_n, block_size_k \
     );\
 
+#if 1
 extern "C" void moe_gemm_wmma(
     const void* input,                // [size_m, size_k]
     const void* weights,              // [num_experts, size_n, size_k]
@@ -522,6 +523,7 @@ extern "C" void moe_gemm_wmma(
         #endif
     }
 }
+#endif
 
 extern "C" void moe_gemm_wmma_fp8(
     const void* input,                // [size_m, size_k] in half/bf16

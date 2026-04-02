@@ -10,7 +10,42 @@ use kernels::ffi;
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::cuda_backend::WrapErr;
-    let (num_tokens, _) = logits.dims2()?;
+    let (num_tokens, num_experts) = logits.dims2()?;
+
+    fn choreo_route(logits: &Tensor, topk: usize) -> Result<Option<(Tensor, Tensor)>> {
+        let (num_tokens, num_experts) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+        let (logits, _) = logits.storage_and_layout();
+        let logits = match &*logits {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            _ => candle::bail!("logits must be a cuda tensor"),
+        };
+        let topk_ids = unsafe { dev.alloc::<u32>(num_tokens * topk) }.w()?;
+        let topk_weights = unsafe { dev.alloc::<f32>(num_tokens * topk) }.w()?;
+        let stream = *dev.cu_stream() as i64;
+        let ok = unsafe {
+            ffi::choreo_fused_moe_route(
+                *logits.device_ptr() as *const f32,
+                *topk_ids.device_ptr() as *mut i32,
+                *topk_weights.device_ptr() as *mut f32,
+                num_tokens as i32,
+                num_experts as i32,
+                topk as i32,
+                stream,
+            )
+        };
+        if ok == 0 {
+            return Ok(None);
+        }
+        let topk_weights = candle::CudaStorage::wrap_cuda_slice(topk_weights, dev.clone());
+        let topk_weights =
+            Tensor::from_storage(candle::Storage::Cuda(topk_weights), (num_tokens, topk))?;
+        let topk_ids = candle::CudaStorage::wrap_cuda_slice(topk_ids, dev.clone());
+        let topk_ids =
+            Tensor::from_storage(candle::Storage::Cuda(topk_ids), (num_tokens, topk))?;
+        Ok(Some((topk_weights, topk_ids)))
+    }
+
     fn cuda_fwd(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         let (num_tokens, num_experts) = logits.dims2()?;
         let dev = logits.device().as_cuda_device()?;
@@ -44,14 +79,6 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
             )
         }
 
-        // not used
-        // let token_expert_indices =
-        //     candle::CudaStorage::wrap_cuda_slice(token_expert_indices, dev.clone());
-        // let token_expert_indices = Tensor::from_storage(
-        //     candle::Storage::Cuda(token_expert_indices),
-        //     (num_tokens, topk),
-        // )?;
-
         let topk_weights = candle::CudaStorage::wrap_cuda_slice(topk_weights, dev.clone());
         let topk_weights =
             Tensor::from_storage(candle::Storage::Cuda(topk_weights), (num_tokens, topk))?;
@@ -63,11 +90,16 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         Ok((topk_weights, topk_indices))
     }
 
+    let use_choreo_route = num_experts == 256 && topk == 8;
+
+    if use_choreo_route {
+        if let Some(result) = choreo_route(logits, topk)? {
+            return Ok(result);
+        }
+    }
     if num_tokens > 64 {
-        // fused topk faster for longer context
         cuda_fwd(logits, topk)
     } else {
-        // unfused topk suitable for decoding
         let routing_weights = candle_nn::ops::softmax_last_dim(&logits)?;
         let indices = routing_weights
             .arg_sort_last_dim(false)?

@@ -3,6 +3,7 @@ use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    // rebuild trigger: k512 support for down GEMM path
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
@@ -170,6 +171,15 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
     // println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-search=native=/home/wsj/dev/croktile");
+    println!("cargo:rustc-link-lib=fmquant");
 
+    // RELINK_fused_moe_vllm_maxm_routesync_1712051640
     Ok(())
 }
+
+
+
+
+// RELINK_1775110217
+// RELINK_1775110739
